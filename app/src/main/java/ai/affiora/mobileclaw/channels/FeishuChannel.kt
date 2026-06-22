@@ -73,6 +73,19 @@ class FeishuChannel(
         private const val KEY_PAIRED = "paired_chats"
         private const val POLL_INTERVAL_MS = 30_000L
         private const val DEFAULT_DOMAIN = "open.feishu.cn"
+
+        /**
+         * Extracts a Feishu text-message body JSON ({"text":"..."}) into a non-blank string.
+         * Returns null if parse fails, key missing, or text is blank/whitespace-only.
+         * Port of openclaw 38aac70: empty-text and whitespace-only messages must be dropped to
+         * avoid blank user turns reaching downstream LLMs (MiniMax rejects "messages must not be
+         * empty (2013)"). Extracted for direct unit testing.
+         */
+        @JvmStatic
+        internal fun parseFeishuTextContent(bodyContentJson: String, json: Json): String? =
+            runCatching {
+                json.parseToJsonElement(bodyContentJson).jsonObject["text"]?.jsonPrimitive?.content
+            }.getOrNull()?.takeIf { it.isNotBlank() }
     }
 
     init { loadPaired() }
@@ -198,22 +211,23 @@ class FeishuChannel(
                 val senderId = item["sender"]?.jsonObject?.get("id")?.jsonPrimitive?.content ?: ""
 
                 val bodyContent = item["body"]?.jsonObject?.get("content")?.jsonPrimitive?.content ?: continue
-                // body.content is a JSON string: {"text":"actual text"}
-                val text = runCatching {
-                    json.parseToJsonElement(bodyContent).jsonObject["text"]?.jsonPrimitive?.content
-                }.getOrNull() ?: continue
+                val text = parseFeishuTextContent(bodyContent, json) ?: continue
 
-                channelManager.onMessageReceived(
-                    IncomingMessage(
-                        channelId = id,
-                        chatId = chatId,
-                        senderId = chatId,  // pair by chat
-                        senderName = senderId,
-                        text = text,
-                        timestamp = createTime,
-                    ),
-                )
                 if (createTime > maxTs) maxTs = createTime
+
+                // Fire-and-forget: don't block pollOnce while the AI responds.
+                scope.launch {
+                    channelManager.onMessageReceived(
+                        IncomingMessage(
+                            channelId = id,
+                            chatId = chatId,
+                            senderId = chatId,
+                            senderName = senderId,
+                            text = text,
+                            timestamp = createTime,
+                        ),
+                    )
+                }
             }
             lastMsgTs[chatId] = maxTs
         }

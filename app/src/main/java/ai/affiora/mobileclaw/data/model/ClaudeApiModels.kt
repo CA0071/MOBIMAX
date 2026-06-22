@@ -99,4 +99,26 @@ data class ClaudeResponse(
     val outputTokens: Int = 0,
     /** Thinking text extracted from thinking blocks (not serialized to API). */
     val thinkingText: String? = null,
+    // Item D (v1.2.12): when provider failover is enabled, these fields surface the
+    // provider/model that actually produced this response (may differ from request.model
+    // if a fallback was used). attemptTrace lists every attempted provider with outcome.
+    val actualProviderId: String? = null,
+    val actualModelId: String? = null,
+    val attemptTrace: List<AttemptOutcome> = emptyList(),
+)
+
+/**
+ * One entry in the failover attempt log. Surfaced in [ClaudeResponse.attemptTrace] so
+ * UI/debug can show "openai:429 → anthropic:200" rather than only seeing the final result.
+ *
+ * Boundary (spec §6 ❌): every attempted provider's outcome MUST be captured here.
+ * Swallowing the primary provider's error breaks debug.
+ */
+@Serializable
+data class AttemptOutcome(
+    val providerId: String,
+    val modelId: String,
+    val httpCode: Int? = null,
+    val errorBody: String? = null,
+    val durationMs: Long = 0,
 )

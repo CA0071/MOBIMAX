@@ -298,7 +298,14 @@ class ChannelManager @Inject constructor(
             "Read-only tools (search, check status, etc.) work directly. " +
             "Write/send/call/UI tools will ask the phone owner to confirm. " +
             "Never share API keys, passwords, or financial data via this channel. " +
-            "Keep responses concise (under 4000 characters)."
+            "Keep responses concise (under 4000 characters). " +
+            // Item B: when a tool returns a structured permission_denied error (JSON in the
+            // error message body), relay the actionHint field verbatim — including any
+            // mention of Settings — so the user gets actionable guidance, not a generic
+            // 'I can't' message.
+            "When a tool error message starts with `{\"errorType\":\"permission_denied\"`, " +
+            "parse the JSON and tell the user the actionHint field text exactly as written; " +
+            "do not paraphrase or shorten. This includes the Settings path."
 
         // Build user message text, appending media descriptions if present
         val userMessageText = if (msg.mediaDescription != null) {

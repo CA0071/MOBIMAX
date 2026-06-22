@@ -40,8 +40,14 @@
     <!-- Microphone (voice input) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
-    <!-- Alarm/Timer (delegates to system clock app) -->
+    <!-- Alarm/Timer (delegates to system clock app for set_timer / show_alarms) -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <!-- Item A (v1.2.12): AlarmManager.setAlarmClock used by AlarmTimerTool.set_alarm
+         to bypass the Background-Activity-Start restriction that silently dropped the
+         original startActivity-based path. SCHEDULE_EXACT_ALARM is API 31+; USE_EXACT_ALARM
+         (granted automatically) covers API 33+. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <!-- Photos (API 33+) -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -163,6 +169,12 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- Item A (v1.2.12): receives alarms scheduled via AlarmManager.setAlarmClock
+             from AlarmTimerTool. Posts a high-priority notification at trigger time. -->
+        <receiver
+            android:name=".tools.AlarmReceiver"
+            android:exported="false" />
 
         <!-- Firebase Messaging — Phase 3, uncomment when google-services.json is added
         <service

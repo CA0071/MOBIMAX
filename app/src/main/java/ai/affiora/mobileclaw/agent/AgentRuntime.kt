@@ -93,6 +93,10 @@ class AgentRuntime @Inject constructor(
 
         var iterations = 0
         var consecutiveToolErrors = 0
+        // Item E (v1.2.12) auto-skill trigger inputs (collected across loop iterations)
+        val usedToolNames = mutableSetOf<String>()
+        var successfulToolCount = 0
+        var hadRejectedConfirmation = false
 
         while (iterations < MAX_ITERATIONS) {
             iterations++
@@ -152,6 +156,7 @@ class AgentRuntime @Inject constructor(
                     }
                     is ContentBlock.ToolUseBlock -> {
                         hasToolUse = true
+                        usedToolNames.add(block.name) // Item E trigger tracking
                         val inputMap: Map<String, JsonElement> = block.input.toMap()
                             .filterKeys { it != "__confirmed" }  // STRIP — AI cannot set this
                         Log.d("AgentRuntime", "Tool call: ${block.name}")
@@ -174,6 +179,12 @@ class AgentRuntime @Inject constructor(
                                 consecutiveToolErrors++
                             } else {
                                 consecutiveToolErrors = 0
+                            }
+                            // Item E trigger tracking — count successful results, flag rejections
+                            if (rawResult.startsWith("Action cancelled by user")) {
+                                hadRejectedConfirmation = true
+                            } else if (!rawResult.startsWith("Error:")) {
+                                successfulToolCount++
                             }
                         }
 
@@ -220,6 +231,17 @@ class AgentRuntime @Inject constructor(
             }
 
             if (response.stopReason == "end_turn" || !hasToolUse) {
+                // Item E (v1.2.12): on natural turn completion, evaluate auto-skill trigger.
+                // The follow-up runs OUTSIDE the agent flow (no AgentEvent emission); failures
+                // are logged and never block the user-facing reply.
+                runCatching {
+                    maybeRunSkillFollowup(
+                        conversationContext = messages.toList(),
+                        usedToolNames = usedToolNames.toSet(),
+                        successfulToolCount = successfulToolCount,
+                        hadRejectedConfirmation = hadRejectedConfirmation,
+                    )
+                }.onFailure { Log.w("AgentRuntime", "autoskill_followup_failed: ${it.message}") }
                 break
             }
         }
@@ -349,6 +371,10 @@ class AgentRuntime @Inject constructor(
 
         var iterations = 0
         var consecutiveToolErrors = 0
+        // Item E (v1.2.12) auto-skill trigger inputs (collected across loop iterations)
+        val usedToolNames = mutableSetOf<String>()
+        var successfulToolCount = 0
+        var hadRejectedConfirmation = false
 
         while (iterations < MAX_ITERATIONS) {
             iterations++
@@ -465,6 +491,17 @@ class AgentRuntime @Inject constructor(
             }
 
             if (response.stopReason == "end_turn" || !hasToolUse) {
+                // Item E (v1.2.12): on natural turn completion, evaluate auto-skill trigger.
+                // The follow-up runs OUTSIDE the agent flow (no AgentEvent emission); failures
+                // are logged and never block the user-facing reply.
+                runCatching {
+                    maybeRunSkillFollowup(
+                        conversationContext = messages.toList(),
+                        usedToolNames = usedToolNames.toSet(),
+                        successfulToolCount = successfulToolCount,
+                        hadRejectedConfirmation = hadRejectedConfirmation,
+                    )
+                }.onFailure { Log.w("AgentRuntime", "autoskill_followup_failed: ${it.message}") }
                 break
             }
         }
@@ -532,9 +569,162 @@ class AgentRuntime @Inject constructor(
 
     fun getToolNames(): List<String> = toolRegistry.keys.sorted()
 
+    // ── Item E (v1.2.12): Auto-skill follow-up ────────────────────────────────
+
+    /**
+     * Hidden follow-up pass that asks the LLM to draft a reusable skill from a completed
+     * conversation. Called from [run]/[runWithHistory] after `stop_reason==end_turn`.
+     *
+     * Trigger conditions (all must hold):
+     *   - autoSkillMode != Off  (and AutoOnRemote skips local providers)
+     *   - successfulToolCount >= 2 (count of successful results, not call count)
+     *   - distinct used tool names >= 2 (workflow signal — Codex round 2 granularity)
+     *   - "skills_author" not in usedToolNames (recursion guard + already-doing-it skip)
+     *   - !hadRejectedConfirmation
+     *
+     * Isolation (Codex round 2):
+     *   - Uses a tool registry containing only `skills_author` — never the full registry
+     *   - Calls [ClaudeApiClient.sendMessage] directly, NOT [run] — no AgentEvent emission,
+     *     no recursive AgentRuntime entry
+     *   - LLM reply is logged but never appended to chat history or sent to channels
+     *
+     * Boundary (spec §6 ❌): drafted skills are written via `id_strategy=or_suffix` which
+     * does NOT auto-enable. User must explicitly enable in the Skills screen.
+     */
+    internal suspend fun maybeRunSkillFollowup(
+        conversationContext: List<ClaudeMessage>,
+        usedToolNames: Set<String>,
+        successfulToolCount: Int,
+        hadRejectedConfirmation: Boolean,
+    ) {
+        val mode = userPreferences.autoSkillMode.first()
+        if (mode == "Off") {
+            Log.d(TAG, "autoskill_skipped: reason=mode_off")
+            return
+        }
+        if (successfulToolCount < 2) {
+            Log.d(TAG, "autoskill_skipped: reason=too_few_successful_tools count=$successfulToolCount")
+            return
+        }
+        if (usedToolNames.size < 2) {
+            Log.d(TAG, "autoskill_skipped: reason=single_tool_workflow used=$usedToolNames")
+            return
+        }
+        if ("skills_author" in usedToolNames) {
+            Log.d(TAG, "autoskill_skipped: reason=skills_author_already_used")
+            return
+        }
+        if (hadRejectedConfirmation) {
+            Log.d(TAG, "autoskill_skipped: reason=user_rejected_confirmation")
+            return
+        }
+
+        val providerId = userPreferences.selectedProvider.first()
+        val provider = AiProvider.fromId(providerId)
+        if (mode == "AutoOnRemote") {
+            if (provider.isLocal) {
+                Log.d(TAG, "autoskill_skipped: reason=auto_on_remote_but_local")
+                return
+            }
+            if (provider.requiresCustomBaseUrl) {
+                val baseUrl = userPreferences.getBaseUrlForProvider(provider.id)
+                if ("localhost" in baseUrl || "127.0.0.1" in baseUrl) {
+                    Log.d(TAG, "autoskill_skipped: reason=auto_on_remote_but_localhost")
+                    return
+                }
+            }
+        }
+
+        val skillsAuthorTool = toolRegistry["skills_author"]
+        if (skillsAuthorTool == null) {
+            Log.w(TAG, "autoskill_skipped: reason=skills_author_tool_not_registered")
+            return
+        }
+
+        Log.i(TAG, "autoskill_trigger: tools=${usedToolNames.size} successful=$successfulToolCount")
+
+        val followupSystem = """
+            You analyze a completed user task and decide whether the workflow should be saved
+            as a reusable skill. Use the skills_author tool with action="create" and id_strategy="or_suffix"
+            to save a draft. Drafts will not auto-activate — the user reviews them later.
+
+            Save a skill only if ALL of these are true:
+            (a) The conversation shows a generic, repeatable pattern — not a one-off lookup or
+                user-specific operation tied to a single account, ID, or piece of data.
+            (b) The SKILL.md content contains NO PII, secrets, tokens, account IDs, names, dates,
+                or session-specific values. Use placeholders like {{date}} or {{recipient}}.
+            (c) The skill spans 2+ tools or steps (single-tool flows aren't worth saving).
+
+            If the criteria are not met, reply with the literal text "no skill" and call no tools.
+
+            SKILL.md format: YAML frontmatter (name, description, tools_required) then body.
+        """.trimIndent()
+
+        val recentTurns = conversationContext.takeLast(8).joinToString("\n\n") { msg ->
+            val text = when (val c = msg.content) {
+                is ClaudeContent.Text -> c.text
+                else -> "[non-text content]"
+            }
+            "[${msg.role}] ${text.take(2000)}"
+        }
+        val followupUser = "Review this completed task. If a reusable skill emerges, save it as a draft. Otherwise reply 'no skill'.\n\n$recentTurns"
+
+        val isolatedTool = ClaudeTool(
+            name = skillsAuthorTool.name,
+            description = skillsAuthorTool.description,
+            inputSchema = skillsAuthorTool.parameters,
+        )
+
+        val request = ClaudeRequest(
+            model = userPreferences.selectedModel.first(),
+            messages = listOf(ClaudeMessage(role = "user", content = ClaudeContent.Text(followupUser))),
+            system = followupSystem,
+            tools = listOf(isolatedTool),
+            maxTokens = 2048,
+        )
+
+        Log.i(TAG, "autoskill_followup_started: provider=${provider.id}")
+        val response = try {
+            apiClient.sendMessage(request)
+        } catch (e: Exception) {
+            Log.w(TAG, "autoskill_followup_api_failed: ${e.message?.take(200)}")
+            return
+        }
+
+        // Execute any skills_author tool_use the LLM emitted. We DO NOT call
+        // executeAndEmit because there is no flow collector here — and that's intentional
+        // (Codex spec §7E: no chat history pollution, no UI events).
+        for (block in response.content) {
+            if (block !is ContentBlock.ToolUseBlock) continue
+            if (block.name != "skills_author") {
+                Log.w(TAG, "autoskill_followup_unexpected_tool: ${block.name} (registry isolation should have prevented this)")
+                continue
+            }
+            val rawInput = block.input.toMap().filterKeys { it != "__confirmed" }
+            // Force or_suffix mode regardless of what the LLM put in the call. Boundary
+            // §6 ❌: auto-skill follow-up MUST NOT use id_strategy="exact" path because
+            // that auto-enables skills.
+            val forcedInput = rawInput.toMutableMap().apply {
+                this["id_strategy"] = JsonPrimitive("or_suffix")
+            }
+            val result = try {
+                skillsAuthorTool.execute(forcedInput)
+            } catch (e: Exception) {
+                Log.w(TAG, "autoskill_skill_create_failed: ${e.message?.take(200)}")
+                continue
+            }
+            when (result) {
+                is ToolResult.Success -> Log.i(TAG, "autoskill_drafted: ${result.data.take(300)}")
+                is ToolResult.Error -> Log.w(TAG, "autoskill_skill_create_error: ${result.message.take(300)}")
+                is ToolResult.NeedsConfirmation -> Log.w(TAG, "autoskill_unexpected_confirmation_request: id_strategy=or_suffix should bypass")
+            }
+        }
+    }
+
     companion object {
         private const val MAX_ITERATIONS = 200
         private const val MAX_TOKENS = 8192
+        private const val TAG = "AgentRuntime"
     }
 }
 
@@ -599,8 +789,11 @@ internal fun formatNetworkError(e: Throwable): String {
                 "(2) it's bound to 127.0.0.1 only — set OLLAMA_HOST=0.0.0.0:11434 or " +
                 "enable LM Studio's network exposure; (3) the port is blocked by a firewall."
         is java.net.SocketTimeoutException ->
-            "The server is taking too long to respond. Check your network signal. " +
-                "(If using Tailscale or another VPN, also verify the tunnel is up.)"
+            "The server exceeded the ${HttpTimeouts.REQUEST_MINUTES}-minute response limit. " +
+                "For reasoning models (DeepSeek R1, MiniMax M2, Nemotron Ultra, etc.) try " +
+                "a simpler prompt or switch to a faster non-reasoning model. Also check " +
+                "your network signal (if using Tailscale or another VPN, verify the " +
+                "tunnel is up)."
         else ->
             "Network error: ${e.message ?: e.javaClass.simpleName}"
     }

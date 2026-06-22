@@ -68,6 +68,58 @@ class SettingsViewModel @Inject constructor(
 
     val allowedTools: StateFlow<Set<String>> = permissionManager.allowedTools
 
+    // ── v1.2.12 advanced flags (Items C/D/E) ──────────────────────────────
+
+    val bedrockMaxThinkingEnabled: StateFlow<Boolean> = userPreferences.bedrockMaxThinkingEnabled
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    val failoverEnabled: StateFlow<Boolean> = userPreferences.failoverEnabled
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    val failoverChain: StateFlow<List<String>> = userPreferences.failoverChain
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val failoverMaxAttempts: StateFlow<Int> = userPreferences.failoverMaxAttempts
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 1)
+
+    val autoSkillMode: StateFlow<String> = userPreferences.autoSkillMode
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "Off")
+
+    fun setBedrockMaxThinkingEnabled(v: Boolean) {
+        viewModelScope.launch { userPreferences.setBedrockMaxThinkingEnabled(v) }
+    }
+
+    fun setFailoverEnabled(v: Boolean) {
+        viewModelScope.launch { userPreferences.setFailoverEnabled(v) }
+    }
+
+    fun setFailoverChain(chain: List<String>) {
+        // §12 migration: drop primary from chain, drop blanks/dupes (UserPreferences also does this).
+        viewModelScope.launch {
+            val primary = userPreferences.selectedProvider.first()
+            userPreferences.setFailoverChain(chain.filter { it != primary })
+        }
+    }
+
+    fun setFailoverMaxAttempts(n: Int) {
+        viewModelScope.launch { userPreferences.setFailoverMaxAttempts(n) }
+    }
+
+    fun setAutoSkillMode(mode: String) {
+        viewModelScope.launch { userPreferences.setAutoSkillMode(mode) }
+    }
+
+    /**
+     * §12 Migration: when user removes a provider's token (i.e. "deletes the provider"),
+     * also strip it from the failover chain to avoid dangling references at runtime.
+     */
+    private suspend fun stripProviderFromFailoverChain(providerId: String) {
+        val current = userPreferences.failoverChain.first()
+        if (providerId in current) {
+            userPreferences.setFailoverChain(current.filter { it != providerId })
+        }
+    }
+
     /** True when no providers have a configured API key. */
     private val _noKeysConfigured = MutableStateFlow(false)
     val noKeysConfigured: StateFlow<Boolean> = _noKeysConfigured.asStateFlow()
@@ -119,6 +171,9 @@ class SettingsViewModel @Inject constructor(
     fun removeKey(providerId: String) {
         viewModelScope.launch {
             userPreferences.setTokenForProvider(providerId, "")
+            // §12 migration: removing a provider also strips it from the failover chain
+            // to avoid dangling references at runtime.
+            stripProviderFromFailoverChain(providerId)
             // If removing the active provider's key, switch to first provider with a key
             val currentProvider = userPreferences.selectedProvider.first()
             if (currentProvider == providerId) {

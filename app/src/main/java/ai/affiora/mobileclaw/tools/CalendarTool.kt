@@ -1,5 +1,6 @@
 package ai.affiora.mobileclaw.tools
 
+import ai.affiora.mobileclaw.data.model.StructuredToolError
 import android.Manifest
 import android.content.ContentResolver
 import android.content.ContentValues
@@ -83,10 +84,10 @@ class CalendarTool(
             ?: return ToolResult.Error("Missing required parameter: action")
 
         if (action == "events" && readPerm != PackageManager.PERMISSION_GRANTED) {
-            return ToolResult.Error("Calendar read permission not granted. Go to Android Settings > Apps > MobileClaw > Permissions > Calendar to grant it.")
+            return permissionDenied(Manifest.permission.READ_CALENDAR, "read")
         }
         if (action == "add" && writePerm != PackageManager.PERMISSION_GRANTED) {
-            return ToolResult.Error("Calendar write permission not granted. Go to Android Settings > Apps > MobileClaw > Permissions > Calendar to grant it.")
+            return permissionDenied(Manifest.permission.WRITE_CALENDAR, "create events on")
         }
 
         return withContext(Dispatchers.IO) {
@@ -205,6 +206,26 @@ class CalendarTool(
         } catch (e: Exception) {
             ToolResult.Error("Failed to insert calendar event: ${e.message}")
         }
+    }
+
+    /**
+     * Build a structured permission-denied error so the LLM (via system-prompt instruction
+     * in [ai.affiora.mobileclaw.channels.ChannelManager]) relays a precise actionHint with
+     * a tappable Settings deep link, not a generic "I can't access your calendar" string.
+     *
+     * Boundary (spec §6 ❌): deepLinkIntent MUST be the standard Android Settings intent
+     * action — never invented paths.
+     */
+    private fun permissionDenied(permission: String, verb: String): ToolResult {
+        val err = StructuredToolError(
+            errorType = StructuredToolError.ERROR_TYPE_PERMISSION_DENIED,
+            permission = permission,
+            actionHint = "Calendar permission is required to $verb calendar events. " +
+                "Open Android Settings → Apps → MobileClaw → Permissions → Calendar to grant it, " +
+                "then ask me again.",
+            deepLinkIntent = StructuredToolError.SETTINGS_INTENT_APP_DETAILS,
+        )
+        return ToolResult.Error(err.toJsonString())
     }
 
     private fun getPrimaryCalendarId(resolver: ContentResolver): Long? {

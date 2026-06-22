@@ -25,6 +25,12 @@ import kotlinx.serialization.json.put
 class BedrockBackend(
     private val httpClient: HttpClient,
     private val jsonSerializer: Json,
+    /**
+     * If null, max-thinking opt-in is treated as disabled. Tests pass null;
+     * production wires UserPreferences flag through ClaudeApiClient.
+     * Port of openclaw 9189b16.
+     */
+    private val maxThinkingProvider: (() -> Boolean)? = null,
 ) : AiBackend {
 
     override suspend fun send(
@@ -109,6 +115,20 @@ class BedrockBackend(
                 put("maxTokens", request.maxTokens)
             })
 
+            // Port of openclaw 9189b16: only when user opted into max thinking AND
+            // the model is Opus 4.7 specifically. Other Bedrock models (Opus 4.6,
+            // Haiku) do NOT support these fields and would error.
+            if (shouldEnableMaxThinking(request.model)) {
+                put("additionalModelRequestFields", buildJsonObject {
+                    put("thinking", buildJsonObject {
+                        put("type", JsonPrimitive("adaptive"))
+                    })
+                    put("output_config", buildJsonObject {
+                        put("effort", JsonPrimitive("max"))
+                    })
+                })
+            }
+
             // Tool config
             if (request.tools != null && request.tools.isNotEmpty()) {
                 put("toolConfig", buildJsonObject {
@@ -128,6 +148,11 @@ class BedrockBackend(
                 })
             }
         }
+    }
+
+    private fun shouldEnableMaxThinking(modelId: String): Boolean {
+        if (maxThinkingProvider?.invoke() != true) return false
+        return modelId.contains("opus-4-7", ignoreCase = true)
     }
 
     private fun buildBedrockMessage(

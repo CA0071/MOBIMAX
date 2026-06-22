@@ -50,13 +50,31 @@ class ClaudeApiClient @Inject constructor(
             level = LogLevel.INFO
             sanitizeHeader { it == "x-api-key" || it == "Authorization" || it == "x-goog-api-key" }
         }
+        // Without this, OkHttp's default 10s readTimeout silently kills any reasoning-
+        // model call (DeepSeek R1, MiniMax M2.x, Nemotron Ultra) that takes longer
+        // than 10s between packets — surfaced as SocketTimeoutException. Earlier we
+        // only installed this on the tool-use HttpClient in ToolsModule; this client
+        // is a separate instance that was defaulting to OkHttp's 10s read limit.
+        install(io.ktor.client.plugins.HttpTimeout) {
+            requestTimeoutMillis = HttpTimeouts.REQUEST_MS
+            connectTimeoutMillis = HttpTimeouts.CONNECT_MS
+            socketTimeoutMillis = HttpTimeouts.SOCKET_MS
+        }
     }
 
     // ── Backend instances ──────────────────────────────────────────────────
 
     private val localBackend = LocalBackend(localInferenceEngine, localModelManager)
     private val anthropicBackend = AnthropicBackend(jsonSerializer)
-    private val bedrockBackend = BedrockBackend(httpClient, jsonSerializer)
+    private val bedrockBackend = BedrockBackend(
+        httpClient = httpClient,
+        jsonSerializer = jsonSerializer,
+        // openclaw 9189b16: read flag synchronously per request via runBlocking — flag is rarely
+        // toggled and reading from DataStore Flow keeps a single source of truth without caching.
+        maxThinkingProvider = {
+            kotlinx.coroutines.runBlocking { userPreferences.bedrockMaxThinkingEnabled.first() }
+        },
+    )
     private val googleBackend = GoogleBackend(httpClient, jsonSerializer)
     private val openAiCompatibleBackend = OpenAiCompatibleBackend(httpClient, jsonSerializer)
 
@@ -103,17 +121,106 @@ class ClaudeApiClient @Inject constructor(
         onThinkingStarted: (() -> Unit)? = null,
         onRetry: ((attempt: Int, statusCode: Int, delayMs: Long) -> Unit)? = null,
     ): ClaudeResponse {
-        val apiKey = userPreferences.apiKey.first()
-        val providerId = userPreferences.selectedProvider.first()
-        val provider = AiProvider.fromId(providerId)
-        val backend = backendFor(provider)
+        val primaryProviderId = userPreferences.selectedProvider.first()
+        val primaryProvider = AiProvider.fromId(primaryProviderId)
 
-        // Local models don't need an API key or network
-        if (provider.isLocal) {
-            return backend.send(request, apiKey, provider, onTextDelta, onThinkingStarted)
+        // Local models bypass failover entirely — failover is for network providers only.
+        if (primaryProvider.isLocal) {
+            val apiKey = userPreferences.apiKey.first()
+            return backendFor(primaryProvider).send(request, apiKey, primaryProvider, onTextDelta, onThinkingStarted)
         }
 
-        // CUSTOM provider needs a user-supplied base URL; API key is optional (Ollama has no auth)
+        // Item D (v1.2.12): build provider chain. Primary always tried first.
+        // Failover entries appended only when failoverEnabled flag is on, max 2.
+        val failoverEnabled = userPreferences.failoverEnabled.first()
+        val failoverChain: List<AiProvider> = if (failoverEnabled) {
+            val maxAttempts = userPreferences.failoverMaxAttempts.first().coerceIn(1, 2)
+            userPreferences.failoverChain.first()
+                .asSequence()
+                .filter { it != primaryProviderId } // §12 migration: don't dupe the primary
+                .mapNotNull { runCatching { AiProvider.fromId(it) }.getOrNull() } // skip removed providers
+                .filter { !it.isLocal } // local doesn't make sense as failover
+                .take(maxAttempts)
+                .toList()
+        } else {
+            emptyList()
+        }
+
+        val retryPolicy = RetryPolicy(maxFailoverAttempts = failoverChain.size)
+        val attempts = mutableListOf<ai.affiora.mobileclaw.data.model.AttemptOutcome>()
+        val providersToTry = listOf(primaryProvider) + failoverChain
+
+        var lastException: Exception? = null
+        for ((index, provider) in providersToTry.withIndex()) {
+            // Critical (Codex round 5): models are NOT portable across providers — sending
+            // an OpenAI model ID to Anthropic returns deterministic 404. For the primary
+            // provider use request.model as-is; for fallback providers, use the fallback's
+            // first listed model (best-effort default — user accepts this trade-off when
+            // they enable failover, surfaced via actualModelId in response).
+            val effectiveModel = if (index == 0) {
+                request.model
+            } else {
+                provider.models.firstOrNull()?.id ?: request.model
+            }
+            val effectiveRequest = if (effectiveModel == request.model) request else request.copy(model = effectiveModel)
+
+            val attemptStart = System.currentTimeMillis()
+            try {
+                val response = sendOnce(effectiveRequest, provider, onTextDelta, onThinkingStarted, onRetry)
+                val durationMs = System.currentTimeMillis() - attemptStart
+                attempts.add(
+                    ai.affiora.mobileclaw.data.model.AttemptOutcome(
+                        providerId = provider.id,
+                        modelId = effectiveModel,
+                        httpCode = 200,
+                        errorBody = null,
+                        durationMs = durationMs,
+                    )
+                )
+                if (index > 0) {
+                    Log.i(TAG, "failover_succeeded: from=$primaryProviderId to=${provider.id}/$effectiveModel attempt=$index")
+                }
+                return response.copy(
+                    actualProviderId = provider.id,
+                    actualModelId = response.model.ifBlank { effectiveModel },
+                    attemptTrace = attempts.toList(),
+                )
+            } catch (e: Exception) {
+                val durationMs = System.currentTimeMillis() - attemptStart
+                val httpCode = (e as? ClaudeApiException)?.statusCode
+                val errorBody = (e as? ClaudeApiException)?.errorBody?.take(500)
+                attempts.add(
+                    ai.affiora.mobileclaw.data.model.AttemptOutcome(
+                        providerId = provider.id,
+                        modelId = effectiveModel,
+                        httpCode = httpCode,
+                        errorBody = errorBody,
+                        durationMs = durationMs,
+                    )
+                )
+                lastException = e
+                val isLast = index == providersToTry.lastIndex
+                if (isLast || !retryPolicy.shouldFailover(httpCode, e, index)) {
+                    if (index > 0 || failoverEnabled) {
+                        Log.e(TAG, "failover_exhausted: attempts=${attempts.size} last=${e.message?.take(120)}")
+                    }
+                    throw e
+                }
+                Log.w(TAG, "failover_triggered: from=${provider.id} reason=$httpCode -> next provider")
+            }
+        }
+        throw lastException ?: IllegalStateException("Failover exhausted with no exception")
+    }
+
+    private suspend fun sendOnce(
+        request: ClaudeRequest,
+        provider: AiProvider,
+        onTextDelta: ((String) -> Unit)?,
+        onThinkingStarted: (() -> Unit)?,
+        onRetry: ((Int, Int, Long) -> Unit)?,
+    ): ClaudeResponse {
+        val apiKey = userPreferences.getTokenForProvider(provider.id)
+
         val baseUrlOverride: String? = if (provider.requiresCustomBaseUrl) {
             val custom = userPreferences.getBaseUrlForProvider(provider.id)
             if (custom.isBlank()) {
@@ -129,7 +236,7 @@ class ClaudeApiClient @Inject constructor(
         }
 
         return withRetry(onRetry) {
-            backend.send(request, apiKey, provider, onTextDelta, onThinkingStarted, baseUrlOverride)
+            backendFor(provider).send(request, apiKey, provider, onTextDelta, onThinkingStarted, baseUrlOverride)
         }
     }
 

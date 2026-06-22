@@ -59,6 +59,14 @@ class SlackChannel(
 
     lateinit var channelManager: ChannelManager
 
+    // SlackChannel needs its own WebSocket-capable client because Ktor's
+    // WebSockets pipeline interceptor interferes with regular HTTP long-polling
+    // (breaks TelegramChannel getUpdates). The shared HttpClient from
+    // ToolsModule deliberately omits the WebSockets plugin for this reason.
+    private val wsHttpClient = HttpClient(io.ktor.client.engine.okhttp.OkHttp) {
+        install(io.ktor.client.plugins.websocket.WebSockets)
+    }
+
     private var wsJob: Job? = null
     private var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -152,7 +160,7 @@ class SlackChannel(
         // 2. Connect WebSocket (Slack URL already includes the auth; append debug_reconnects)
         val wsUrl = if (open.url.contains("?")) "${open.url}&debug_reconnects=true" else "${open.url}?debug_reconnects=true"
 
-        httpClient.webSocket(urlString = wsUrl) {
+        wsHttpClient.webSocket(urlString = wsUrl) {
             for (frame in incoming) {
                 if (frame !is Frame.Text) continue
                 val text = frame.readText()
@@ -175,6 +183,12 @@ class SlackChannel(
                         handleEventsApi(payload, creds)
                     }
                     "slash_commands", "interactive" -> {
+                        // ACK only — dispatch is intentionally not implemented. If
+                        // dispatch is ever added here (block_actions, modal submit,
+                        // slash command handlers), per OpenClaw #66028 the handler
+                        // MUST call isAllowed(channelId) on the inferred channel id
+                        // before routing to channelManager, otherwise unpaired users
+                        // can trigger side effects via interaction callbacks.
                         if (envelope != null) {
                             runCatching {
                                 send(buildJsonObject { put("envelope_id", JsonPrimitive(envelope)) }.toString())
@@ -207,17 +221,21 @@ class SlackChannel(
         // If message is a top-level message in a channel that should become a thread, use ts.
         val threadTs = event["thread_ts"]?.jsonPrimitive?.content ?: tsStr
 
-        channelManager.onMessageReceived(
-            IncomingMessage(
-                channelId = id,
-                chatId = channelId,
-                senderId = channelId, // pair by Slack channel
-                senderName = userId,
-                text = text,
-                timestamp = ts,
-                threadId = threadTs,
-            ),
-        )
+        // Fire-and-forget: don't block the WebSocket frame loop while
+        // the AI generates a response (same fix as Telegram/Matrix).
+        scope.launch {
+            channelManager.onMessageReceived(
+                IncomingMessage(
+                    channelId = id,
+                    chatId = channelId,
+                    senderId = channelId,
+                    senderName = userId,
+                    text = text,
+                    timestamp = ts,
+                    threadId = threadTs,
+                ),
+            )
+        }
     }
 
     // ── Web API ─────────────────────────────────────────────────────────

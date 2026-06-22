@@ -31,6 +31,16 @@ class UserPreferences(private val context: Context) {
         val DEVICE_NAME = stringPreferencesKey("device_name")
         val PERMISSION_MODE = stringPreferencesKey("permission_mode")
         val ALLOWED_TOOLS = stringSetPreferencesKey("allowed_tools")
+        // C1 (openclaw 9189b16): when true and model is opus-4-7, request body adds
+        // additionalModelRequestFields.output_config.effort=max for max thinking.
+        val BEDROCK_MAX_THINKING_ENABLED = booleanPreferencesKey("bedrock_max_thinking_enabled")
+        // D feature flag — when false, ClaudeApiClient.sendMessage runs single attempt with no fallback.
+        val FAILOVER_ENABLED = booleanPreferencesKey("failover_enabled")
+        val FAILOVER_CHAIN = stringSetPreferencesKey("failover_chain")
+        val FAILOVER_CHAIN_ORDER = stringPreferencesKey("failover_chain_order")
+        val FAILOVER_MAX_ATTEMPTS = stringPreferencesKey("failover_max_attempts")
+        // E feature flag — Off | AutoOnRemote | Always
+        val AUTO_SKILL_MODE = stringPreferencesKey("auto_skill_mode")
         // Per-provider base URL override (used by CUSTOM provider for Ollama/LM Studio/vLLM)
         fun baseUrlKey(providerId: String) = stringPreferencesKey("base_url_$providerId")
         // Per-provider key prefix in EncryptedSharedPreferences
@@ -104,6 +114,32 @@ class UserPreferences(private val context: Context) {
 
     val allowedTools: Flow<Set<String>> = context.dataStore.data.map { prefs ->
         prefs[Keys.ALLOWED_TOOLS] ?: emptySet()
+    }
+
+    val bedrockMaxThinkingEnabled: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.BEDROCK_MAX_THINKING_ENABLED] ?: false
+    }
+
+    val failoverEnabled: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.FAILOVER_ENABLED] ?: false
+    }
+
+    val failoverChain: Flow<List<String>> = context.dataStore.data.map { prefs ->
+        // Stored as ordered comma-separated string to preserve order; SetPreferenceKey
+        // is unordered. Empty list when disabled or not yet configured.
+        prefs[Keys.FAILOVER_CHAIN_ORDER]
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?: emptyList()
+    }
+
+    val failoverMaxAttempts: Flow<Int> = context.dataStore.data.map { prefs ->
+        (prefs[Keys.FAILOVER_MAX_ATTEMPTS]?.toIntOrNull() ?: 1).coerceIn(1, 2)
+    }
+
+    val autoSkillMode: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.AUTO_SKILL_MODE] ?: "Off"
     }
 
     /** Read token for a specific provider. */
@@ -191,6 +227,40 @@ class UserPreferences(private val context: Context) {
     suspend fun setAllowedTools(tools: Set<String>) {
         context.dataStore.edit { prefs ->
             prefs[Keys.ALLOWED_TOOLS] = tools
+        }
+    }
+
+    suspend fun setBedrockMaxThinkingEnabled(enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.BEDROCK_MAX_THINKING_ENABLED] = enabled
+        }
+    }
+
+    suspend fun setFailoverEnabled(enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.FAILOVER_ENABLED] = enabled
+        }
+    }
+
+    suspend fun setFailoverChain(providerIds: List<String>) {
+        // Migration §12: drop empties / dupes / blanks; preserve order via comma-joined string.
+        val cleaned = providerIds.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        context.dataStore.edit { prefs ->
+            prefs[Keys.FAILOVER_CHAIN_ORDER] = cleaned.joinToString(",")
+        }
+    }
+
+    suspend fun setFailoverMaxAttempts(n: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.FAILOVER_MAX_ATTEMPTS] = n.coerceIn(1, 2).toString()
+        }
+    }
+
+    suspend fun setAutoSkillMode(mode: String) {
+        // Allowed values: Off | AutoOnRemote | Always
+        val valid = if (mode in setOf("Off", "AutoOnRemote", "Always")) mode else "Off"
+        context.dataStore.edit { prefs ->
+            prefs[Keys.AUTO_SKILL_MODE] = valid
         }
     }
 
